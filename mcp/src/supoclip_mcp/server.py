@@ -160,12 +160,33 @@ def tool_errors(func: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[
 
 
 def _safe_filename(name: str, default: str) -> str:
-    """Reduce an arbitrary string to a safe ``.mp4`` basename (no path traversal)."""
+    """Reduce an arbitrary string to a safe ``.mp4`` basename (no path traversal).
+
+    Keeps the clip's generated SEO block readable (spaces, ``#tags``, unicode):
+    only path separators, Windows-reserved characters and control bytes are
+    replaced.
+    """
     base = os.path.basename((name or "").strip()) or default
-    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    base = re.sub(r'[\\/:*?"<>|]+', "_", base)
+    base = re.sub(r"[\x00-\x1f\x7f]", "", base)
+    base = re.sub(r"\s+", " ", base).strip().strip(". ")
+    if not base:
+        base = default
     if not base.lower().endswith(".mp4"):
         base = f"{base}.mp4"
     return base
+
+
+async def _clip_stored_name(task_id: str, clip_id: str, fallback: str) -> str:
+    """Best-effort lookup of the clip's generated filename (SEO block)."""
+    try:
+        task = await _client().request("GET", f"/tasks/{task_id}")
+        for clip in task.get("clips") or []:
+            if clip.get("id") == clip_id and clip.get("filename"):
+                return str(clip["filename"])
+    except Exception:
+        pass
+    return fallback
 
 
 # --------------------------------------------------------------------------- #
@@ -638,13 +659,17 @@ async def supoclip_download_clip(
     Args:
         task_id: The owning task id.
         clip_id: The clip id to download.
-        filename: Optional output filename.
+        filename: Optional output filename. Defaults to the clip's generated
+            filename (``<title> - <description> #tags_<suffix>.mp4``).
 
     Returns:
         str: JSON ``{"path": str, "filename": str, "bytes": int}`` — the absolute
         local path of the saved MP4.
     """
-    out_name = _safe_filename(filename or "", default=f"clip_{clip_id}.mp4")
+    out_name = _safe_filename(
+        filename or "",
+        default=await _clip_stored_name(task_id, clip_id, f"clip_{clip_id}.mp4"),
+    )
     result = await _client().download(
         f"/tasks/{task_id}/clips/{clip_id}/file", SETTINGS.download_dir, out_name
     )
@@ -683,12 +708,16 @@ async def supoclip_export_clip(
         task_id: The owning task id.
         clip_id: The clip id to export.
         preset: 'tiktok' | 'reels' | 'shorts'.
-        filename: Optional output filename.
+        filename: Optional output filename. Defaults to the clip's generated
+            filename with the preset appended.
 
     Returns:
         str: JSON ``{"path": str, "filename": str, "bytes": int}``.
     """
-    out_name = _safe_filename(filename or "", default=f"clip_{clip_id}_{preset}.mp4")
+    base_name = await _clip_stored_name(task_id, clip_id, f"clip_{clip_id}.mp4")
+    if base_name.lower().endswith(".mp4"):
+        base_name = base_name[:-4]
+    out_name = _safe_filename(filename or "", default=f"{base_name}_{preset}.mp4")
     result = await _client().download(
         f"/tasks/{task_id}/clips/{clip_id}/export",
         SETTINGS.download_dir,

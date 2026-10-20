@@ -397,6 +397,9 @@ class TaskService(ClipEditingMixin):
                         shareability_score=clip_info.get("shareability_score", 0),
                         hook_type=clip_info.get("hook_type"),
                         hook_title=clip_info.get("hook_title"),
+                        seo_title=clip_info.get("seo_title"),
+                        seo_description=clip_info.get("seo_description"),
+                        seo_tags=clip_info.get("seo_tags"),
                     )
 
                     # Update task's clip IDs array

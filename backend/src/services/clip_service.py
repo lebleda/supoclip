@@ -173,6 +173,9 @@ class ClipEditingMixin:
                         "shareability_score": clip.get("shareability_score", 0),
                         "hook_type": clip.get("hook_type"),
                         "hook_title": clip.get("hook_title"),
+                        "seo_title": clip.get("seo_title"),
+                        "seo_description": clip.get("seo_description"),
+                        "seo_tags": clip.get("seo_tags"),
                     }
                 )
 
@@ -215,6 +218,9 @@ class ClipEditingMixin:
                 shareability_score=clip_info.get("shareability_score", 0),
                 hook_type=clip_info.get("hook_type"),
                 hook_title=clip_info.get("hook_title"),
+                seo_title=clip_info.get("seo_title"),
+                seo_description=clip_info.get("seo_description"),
+                seo_tags=clip_info.get("seo_tags"),
             )
             clip_ids.append(clip_id)
 
@@ -331,6 +337,9 @@ class ClipEditingMixin:
             shareability_score=clip.get("shareability_score", 0),
             hook_type=clip.get("hook_type"),
             hook_title=clip.get("hook_title"),
+            seo_title=clip.get("seo_title"),
+            seo_description=clip.get("seo_description"),
+            seo_tags=clip.get("seo_tags"),
         )
 
         await self.clip_repo.reorder_task_clips(self.db, task_id)

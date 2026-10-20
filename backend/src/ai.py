@@ -8,6 +8,8 @@ import asyncio
 import logging
 import random
 import re
+import time
+import uuid
 
 import httpx
 from pydantic_ai import Agent, NativeOutput
@@ -29,12 +31,20 @@ IDEAL_CLIP_MIN_SECONDS = 25
 IDEAL_CLIP_MAX_SECONDS = 50
 MIN_ACCEPTED_CLIP_SECONDS = 15
 MAX_ACCEPTED_CLIP_SECONDS = 60
-TRANSCRIPT_ANALYSIS_CACHE_VERSION = "hook-titles-v5-grounded"
+TRANSCRIPT_ANALYSIS_CACHE_VERSION = "seo-filename-block-v6"
 TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS = 3
 TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = 600
 TRANSIENT_MODEL_STATUS_CODES = {408, 429, 500, 502, 503, 504, 529}
 HOOK_TITLE_MAX_CHARS = 64
 HOOK_TITLE_MAX_WORDS = 10
+SEO_TITLE_MAX_CHARS = 100
+SEO_DESCRIPTION_MAX_CHARS = 200
+SEO_TAGS_MAX = 10
+SEO_TAGS_MAX_CHARS = 40
+# Block budget. Not just the 255-char filesystem filename limit: the sidecar
+# "<clip>.source_map.json" adds 16 chars and render temp dirs are ~60 deep, so
+# 160 keeps every derived path under Windows MAX_PATH (260).
+CLIP_FILENAME_MAX_CHARS = 160
 TRANSCRIPT_SPAN_RE = re.compile(
     r"^\[(?P<start>\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*"
     r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?)\]\s*(?P<text>.*)$"
@@ -172,6 +182,30 @@ class TranscriptSegment(BaseModel):
             "the segment content, no hashtags, no emojis, no surrounding quotes."
         ),
     )
+    seo_title: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("seo_title", "video_title", "clip_title"),
+        description=(
+            "SEO filename title for the clip (4-12 words, max ~100 chars). "
+            "Readable, searchable, grounded in the segment. No hashtags, no emojis."
+        ),
+    )
+    seo_description: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("seo_description", "description", "summary"),
+        description=(
+            "One-sentence SEO description of the clip (max ~200 chars). "
+            "Grounded in what the clip actually shows or says."
+        ),
+    )
+    seo_tags: Optional[List[str]] = Field(
+        default=None,
+        validation_alias=AliasChoices("seo_tags", "tags", "keywords"),
+        description=(
+            "3-8 short searchable tags/keywords for the clip "
+            "(lowercase, no '#', no spaces > 3 words each)."
+        ),
+    )
 
     @field_validator("relevance_score", mode="before")
     @classmethod
@@ -242,7 +276,7 @@ OUTPUT CONTRACT:
 - Return valid JSON only. Do not output Markdown, headings, bullets, prose, code fences, explanations, or commentary outside the JSON object.
 - The top-level JSON object must include: "most_relevant_segments", "summary", and "key_topics".
 - Set "broll_opportunities" to null when B-roll was not requested.
-- Each item in "most_relevant_segments" must include: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", and "hook_title".
+- Each item in "most_relevant_segments" must include: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", "hook_title", "seo_title", "seo_description", and "seo_tags".
 - Do not use "segment" as an output field. Use "text".
 - "virality" must include: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", and "virality_reasoning".
 - Every returned segment must be 15-60 seconds long. Prefer 25-50 seconds.
@@ -328,6 +362,19 @@ HOOK TYPES to identify:
 - "story": Starts with narrative/anecdote
 - "contrast": Before/after or problem/solution framing
 - "none": No clear hook pattern
+
+FILE NAMING METADATA (seo_title, seo_description, seo_tags):
+These three fields become the exported clip's filename block, so they are the
+clip's permanent title, description and tags — not on-screen text.
+- "seo_title": the clip's full title. 4-12 words, under 100 characters, plain
+  readable text (spaces, not underscores). Make it specific and searchable like
+  a good YouTube title; grounded in the segment only.
+- "seo_description": one sentence (max ~200 chars) describing what happens in
+  the clip. No hashtags, no emojis.
+- "seo_tags": 3-8 lowercase keywords or short phrases (e.g. "startup advice",
+  "negotiation tip"). No '#', each tag at most 3 words.
+- Never reuse the on-screen hook_title verbatim as seo_title; the hook is a
+  scroller-stopper burned into the video, the seo_title is the file name.
 
 B-ROLL OPPORTUNITIES:
 Identify 2-4 moments in each segment where B-roll footage could enhance the video:
@@ -554,8 +601,11 @@ JSON-only output requirements:
 - Return one valid JSON object and nothing else.
 - No Markdown, headings, bullets, code fences, or explanatory text outside JSON.
 - Top-level keys: "most_relevant_segments", "summary", "key_topics", "broll_opportunities".{' Set "broll_opportunities" to null.' if not include_broll else ''}
-- Segment keys: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", "hook_title".
+- Segment keys: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", "hook_title", "seo_title", "seo_description", "seo_tags".
 - "hook_title" is a 3-9 word plain-text headline for the clip, grounded in the segment (no hashtags, emojis, or quotes).
+- "seo_title" is the clip's filename title (4-12 words, under 100 chars, plain readable text).
+- "seo_description" is one sentence (max 200 chars) of what the clip contains.
+- "seo_tags" is a JSON array of 3-8 lowercase keywords (no '#', each at most 3 words).
 - Virality keys: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", "virality_reasoning".
 - Do not return segments shorter than {MIN_ACCEPTED_CLIP_SECONDS} seconds or longer than {MAX_ACCEPTED_CLIP_SECONDS} seconds.
 
@@ -592,6 +642,145 @@ def sanitize_hook_title(raw: Optional[str]) -> Optional[str]:
             ".,;:-–— "
         )
     return title or None
+
+
+def sanitize_seo_title(raw: Optional[str]) -> Optional[str]:
+    """Normalize the AI clip title used as the filename head."""
+    if not raw:
+        return None
+    title = str(raw).strip().strip("\"'`“”‘’")
+    title = re.sub(r"#\w+", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    title = title.rstrip(".,;:-–— ").strip()
+    if not title:
+        return None
+    if len(title) > SEO_TITLE_MAX_CHARS:
+        clipped = title[: SEO_TITLE_MAX_CHARS + 1]
+        cut = clipped.rfind(" ")
+        title = (clipped[:cut] if cut > 20 else title[:SEO_TITLE_MAX_CHARS]).rstrip(
+            ".,;:-–— "
+        )
+    return title or None
+
+
+def sanitize_seo_description(raw: Optional[str]) -> Optional[str]:
+    """Normalize the one-line clip description kept in the filename block."""
+    if not raw:
+        return None
+    text = str(raw).strip().strip("\"'`“”‘’")
+    text = re.sub(r"#\w+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if len(text) > SEO_DESCRIPTION_MAX_CHARS:
+        clipped = text[: SEO_DESCRIPTION_MAX_CHARS + 1]
+        cut = clipped.rfind(" ")
+        text = (clipped[:cut] if cut > 20 else text[:SEO_DESCRIPTION_MAX_CHARS]).rstrip(
+            " .,;:-–—"
+        )
+    return text or None
+
+
+def sanitize_seo_tags(raw: Optional[Any]) -> Optional[List[str]]:
+    """Normalize the AI tag list into clean, deduplicated search tags."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = re.split(r"[,;|]", raw)
+    if not isinstance(raw, (list, tuple)):
+        return None
+
+    tags: List[str] = []
+    for item in raw:
+        if item is None:
+            continue
+        tag = str(item).strip().strip("\"'`“”‘’")
+        tag = re.sub(r"^(tags?|keywords?|labels?)\s*:\s*", "", tag, flags=re.IGNORECASE)
+        tag = re.sub(r"^#+", "", tag)
+        tag = re.sub(r"[^a-zA-Z0-9 \-]+", " ", tag)
+        tag = re.sub(r"\s+", " ", tag).strip().lower()
+        if not tag:
+            continue
+        if len(tag) > SEO_TAGS_MAX_CHARS:
+            tag = tag[:SEO_TAGS_MAX_CHARS].rstrip(" -").strip()
+        if not tag:
+            continue
+        if tag not in tags:
+            tags.append(tag)
+        if len(tags) >= SEO_TAGS_MAX:
+            break
+    return tags or None
+
+
+def build_clip_filename_block(
+    seo_title: Optional[str],
+    seo_description: Optional[str],
+    seo_tags: Optional[List[str]],
+    *,
+    clip_index: int = 0,
+    start_time: str = "",
+    fallback_title: Optional[str] = None,
+) -> str:
+    """Build the exported clip filename as one block: title - description #tags.
+
+    Replaces the legacy ``clip_<index>_<start>-<end>_<hash>`` scheme. The block
+    is filesystem-safe (Windows/macOS/Linux), unique per task via a short
+    timestamp+index suffix, and truncated to stay well under filesystem limits.
+    """
+    title = sanitize_seo_title(seo_title) or sanitize_seo_title(fallback_title) or "clip"
+
+    def _clean(text: str) -> str:
+        text = re.sub(r"[\\/:*?\"<>|]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _clip_at_word(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        cut = text[:limit].rsplit(" ", 1)[0].strip()
+        return cut or text[:limit].strip()
+
+    slug = _clip_at_word(_clean(title), 120) or "clip"
+
+    description = _clean(sanitize_seo_description(seo_description) or "")
+    if description.lower() == slug.lower():
+        description = ""
+    tags = [t.strip() for t in (sanitize_seo_tags(seo_tags) or []) if t and t.strip()]
+    tag_text = " ".join("#" + re.sub(r"\s+", "-", t) for t in tags)
+
+    # Budget fitting, in priority order: full title, all tags, then the longest
+    # word-boundary description that still fits (dropped below 20 chars so a
+    # filename never ends in a description stub).
+    budget = CLIP_FILENAME_MAX_CHARS
+    desc_part = f" - {description}" if description else ""
+    tags_part = f" {tag_text}" if tag_text else ""
+
+    if len(slug + desc_part + tags_part) > budget:
+        room = budget - len(slug) - len(tags_part) - 3
+        if desc_part and room >= 20:
+            desc_part = f" - {_clip_at_word(description, room)}"
+        else:
+            desc_part = ""
+    block = slug + desc_part + tags_part
+
+    if len(block) > budget:
+        # The tag list alone overflows: keep the leading tags that fit.
+        kept: List[str] = []
+        for tag in tags:
+            candidate = " #" + re.sub(r"\s+", "-", tag)
+            if len(slug + desc_part + "".join(kept) + candidate) > budget:
+                break
+            kept.append(candidate)
+        block = (slug + desc_part + "".join(kept)).strip()
+
+    if len(block) > budget:
+        block = _clip_at_word(block, budget).strip(" -") or slug
+
+    suffix_bits = [str(clip_index + 1)]
+    if start_time:
+        suffix_bits.append(str(start_time).replace(":", "").replace(" ", ""))
+    suffix_bits.append(time.strftime("%m%d%H%M"))
+    suffix_bits.append(uuid.uuid4().hex[:4])
+    return f"{block}_{'_'.join(suffix_bits)}"
 
 
 def _parse_transcript_timestamp_seconds(timestamp: str) -> int:
@@ -931,6 +1120,9 @@ async def get_most_relevant_parts_by_transcript(
                         segment.virality.total_score = calculated_total
 
                 segment.hook_title = sanitize_hook_title(segment.hook_title)
+                segment.seo_title = sanitize_seo_title(segment.seo_title)
+                segment.seo_description = sanitize_seo_description(segment.seo_description)
+                segment.seo_tags = sanitize_seo_tags(segment.seo_tags)
 
                 validated_segments.append(segment)
                 virality_info = (

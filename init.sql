@@ -100,6 +100,11 @@ CREATE TABLE generated_clips (
     shareability_score INTEGER DEFAULT 0,
     hook_type VARCHAR(50),
     hook_title VARCHAR(200),         -- AI-written on-screen headline
+    -- SEO filename metadata: exported clips are named from this block
+    -- ("<seo_title> - <seo_description> #tag1 #tag2_<suffix>.mp4")
+    seo_title VARCHAR(120),
+    seo_description VARCHAR(250),
+    seo_tags TEXT,
 
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP

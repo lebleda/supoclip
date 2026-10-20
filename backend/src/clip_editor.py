@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+import re
 import subprocess
 import tempfile
 import uuid
@@ -38,8 +39,13 @@ EXPORT_PRESETS = {
 }
 
 
-def _safe_name(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}.mp4"
+def derive_clip_name(source: Path, part: str) -> str:
+    """Keep the source clip's SEO filename block when writing an edited copy."""
+    stem = re.sub(r"[\\/:*?\"<>|]+", " ", source.stem).strip() or "clip"
+    stem = re.sub(r"\s+", " ", stem)
+    if len(stem) > 100:
+        stem = (stem[:101].rsplit(" ", 1)[0].strip() or stem[:100])
+    return f"{stem}_{part}_{uuid.uuid4().hex[:6]}.mp4"
 
 
 def _run(command: list[str]) -> None:
@@ -145,7 +151,7 @@ def trim_clip_file(
     input_path: Path, output_dir: Path, start_offset: float, end_offset: float
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / _safe_name("trim")
+    output_path = output_dir / derive_clip_name(input_path, "trim")
     duration = _ffprobe_duration(input_path)
     start = max(0.0, start_offset)
     end = max(start + 0.1, duration - max(end_offset, 0.0))
@@ -174,8 +180,8 @@ def split_clip_file(
     output_dir.mkdir(parents=True, exist_ok=True)
     duration = _ffprobe_duration(input_path)
     split_at = max(0.2, min(split_time, duration - 0.2))
-    first_path = output_dir / _safe_name("split_a")
-    second_path = output_dir / _safe_name("split_b")
+    first_path = output_dir / derive_clip_name(input_path, "a")
+    second_path = output_dir / derive_clip_name(input_path, "b")
 
     _run(
         [
@@ -208,10 +214,10 @@ def split_clip_file(
 
 def merge_clip_files(paths: Iterable[Path], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / _safe_name("merge")
     input_paths = list(paths)
     if not input_paths:
         raise ValueError("No clips provided for merge")
+    output_path = output_dir / derive_clip_name(input_paths[0], "merged")
 
     with tempfile.NamedTemporaryFile(
         "w", suffix=".txt", prefix="supoclip_concat_", delete=False
@@ -258,7 +264,7 @@ def overlay_custom_captions(
     position_y: Optional[float] = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / _safe_name("caption")
+    output_path = output_dir / derive_clip_name(input_path, "captions")
     words = [word for word in caption_text.split() if word.strip()]
     if not words:
         _run(["ffmpeg", "-y", "-i", str(input_path), *_encode_args(), str(output_path)])
@@ -379,7 +385,7 @@ def export_with_preset(input_path: Path, output_dir: Path, preset_name: str) -> 
     if not preset:
         raise ValueError(f"Unknown export preset: {preset_name}")
 
-    output_path = output_dir / _safe_name(preset.name)
+    output_path = output_dir / derive_clip_name(input_path, preset.name)
     scale_filter = (
         f"scale={preset.width}:{preset.height}:"
         "force_original_aspect_ratio=decrease:flags=lanczos,"

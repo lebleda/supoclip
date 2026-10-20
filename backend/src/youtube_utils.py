@@ -6,6 +6,7 @@ Optimized for free yt-dlp downloads with optional Apify fallback.
 import asyncio
 from datetime import datetime
 import logging
+import os
 import re
 import subprocess
 import time
@@ -28,6 +29,25 @@ YOUTUBE_METADATA_PROVIDER_DATA_API = "youtube_data_api"
 YOUTUBE_DOWNLOAD_PROVIDER_YTDLP = "yt_dlp"
 YOUTUBE_DOWNLOAD_PROVIDER_APIFY = "apify"
 YOUTUBE_DATA_API_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+# YouTube increasingly serves "Sign in to confirm you're not a bot" to the
+# default web client. The embedded/tv/android clients still hand out full
+# streams (up to 1080p60) without cookies, so default to those. Override with
+# YTDLP_YOUTUBE_PLAYER_CLIENT=web,tv (comma-separated) if YouTube rotates again.
+DEFAULT_YOUTUBE_PLAYER_CLIENTS = ("web_embedded", "tv", "android")
+
+
+def _youtube_extractor_args() -> Dict[str, Any]:
+    raw = os.getenv("YTDLP_YOUTUBE_PLAYER_CLIENT", "").strip()
+    clients = [c.strip() for c in raw.split(",") if c.strip()] or list(
+        DEFAULT_YOUTUBE_PLAYER_CLIENTS
+    )
+    return {"youtube": {"player_client": clients}}
 
 
 class YouTubeDownloader:
@@ -63,9 +83,10 @@ class YouTubeDownloader:
             "quiet": True,
             "no_warnings": False,  # Show warnings but not info
             "ignoreerrors": False,
+            "extractor_args": _youtube_extractor_args(),
             # Enhanced headers to avoid 403 errors
             "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate",
@@ -90,8 +111,9 @@ def _build_info_options() -> Dict[str, Any]:
         "extractaudio": False,
         "skip_download": True,
         "socket_timeout": 30,
+        "extractor_args": _youtube_extractor_args(),
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",

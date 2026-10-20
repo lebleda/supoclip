@@ -1,5 +1,6 @@
 """Video utils helpers for the video pipeline."""
 
+from .ai import build_clip_filename_block
 from .media.common import (
     Any,
     Dict,
@@ -367,8 +368,172 @@ def create_optimized_clip(
         return False
 
 
-def create_clips_from_segments(
-    video_path: Path,
+SUBSCRIBE_OUTRO_SECONDS = 2.5
+SUBSCRIBE_OUTRO_TEXT = "SUBSCRIBE"
+SUBSCRIBE_OUTRO_SUBTEXT = "NEW CLIPS DAILY"
+SUBSCRIBE_OUTRO_FONT_CANDIDATES = (
+    "Anton-Regular",
+    "BebasNeue-Regular",
+    "ArchivoBlack-Regular",
+    "Poppins-ExtraBold",
+    "TikTokSans-Regular",
+)
+
+
+def _find_outro_font() -> Optional[Path]:
+    for name in SUBSCRIBE_OUTRO_FONT_CANDIDATES:
+        try:
+            found = find_font_path(name)
+        except Exception:
+            found = None
+        if found is not None:
+            return found
+    return None
+
+
+def _ffprobe_frame_rate(video_path: Path) -> float:
+    result = run_ffmpeg_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        timeout=60,
+    )
+    try:
+        numerator, denominator = result.stdout.strip().split("/")
+        fps = float(numerator) / float(denominator)
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
+    return fps if 15.0 <= fps <= 120.0 else 30.0
+
+
+def append_subscribe_outro(clip_path: Path) -> float:
+    """Append a branded SUBSCRIBE end card to a finished clip, in place.
+
+    The card keeps the clip's own dimensions/frame rate: black background with
+    a red subscribe button, white SUBSCRIBE text popping in, a "NEW CLIPS
+    DAILY" tagline and fade in/out. Silent audio is appended when the clip
+    has an audio track so A/V stay in sync.
+
+    Returns the seconds actually appended (0.0 when skipped). Never raises:
+    any failure only logs a warning so the pipeline keeps working.
+    """
+    try:
+        font_path = _find_outro_font()
+        if font_path is None:
+            logger.warning("Subscribe outro skipped: no bold font available")
+            return 0.0
+        width, height = ffprobe_video_size(clip_path)
+        if width <= 0 or height <= 0:
+            return 0.0
+        has_audio = ffprobe_has_audio(clip_path)
+        fps = _ffprobe_frame_rate(clip_path)
+
+        duration = SUBSCRIBE_OUTRO_SECONDS
+        font_main = max(56, min(120, width // 12))
+        font_sub = max(26, min(52, width // 30))
+        button_w = int(min(640, width * 0.72))
+        button_h = font_main + 64
+        button_y = int(height * 0.40)
+        text_y = button_y + (button_h - font_main) // 2 - 6
+        sub_y = button_y + button_h + max(24, height // 40)
+        fps_arg = f"{fps:.3f}"
+
+        with tempfile.TemporaryDirectory(prefix="supoclip_outro_") as temp_dir:
+            temp_root = Path(temp_dir)
+            main_text_file = temp_root / "outro_main.txt"
+            sub_text_file = temp_root / "outro_sub.txt"
+            main_text_file.write_text(SUBSCRIBE_OUTRO_TEXT, encoding="utf-8")
+            sub_text_file.write_text(SUBSCRIBE_OUTRO_SUBTEXT, encoding="utf-8")
+            output_path = clip_path.with_name(
+                f".{clip_path.stem}.outro{clip_path.suffix}"
+            )
+
+            card_filters = (
+                "format=yuv420p,"
+                f"drawbox=x=(w-{button_w})/2:y={button_y}:w={button_w}:h={button_h}:color=red:t=fill,"
+                f"drawtext=fontfile={ffmpeg_escape_filter_path(font_path)}"
+                f":textfile={ffmpeg_escape_filter_path(main_text_file)}"
+                f":fontsize={font_main}:fontcolor=white"
+                f":x=(w-text_w)/2:y={text_y}:enable='gte(t,0.25)',"
+                f"drawtext=fontfile={ffmpeg_escape_filter_path(font_path)}"
+                f":textfile={ffmpeg_escape_filter_path(sub_text_file)}"
+                f":fontsize={font_sub}:fontcolor=0xCCCCCC"
+                f":x=(w-text_w)/2:y={sub_y}:enable='gte(t,0.5)',"
+                "fade=t=in:st=0:d=0.4,"
+                f"fade=t=out:st={duration - 0.4:.3f}:d=0.4,"
+                "format=yuv420p"
+            )
+            filter_complex = (
+                "[0:v]format=yuv420p,setpts=PTS-STARTPTS[vmain];"
+                f"[1:v]{card_filters}[vcard];"
+                "[vmain][vcard]concat=n=2:v=1:a=0[vout]"
+            )
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(clip_path),
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s={width}x{height}:r={fps_arg}:d={duration:.3f}",
+            ]
+            if has_audio:
+                command += [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"anullsrc=r=48000:cl=stereo:d={duration:.3f}",
+                ]
+                filter_complex += (
+                    ";[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                    "asetpts=PTS-STARTPTS[amain];"
+                    "[amain][2:a]concat=n=2:v=0:a=1[aout]"
+                )
+            command += ["-filter_complex", filter_complex, "-map", "[vout]"]
+            if has_audio:
+                command += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+            else:
+                command += ["-an"]
+            command += [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-r",
+                fps_arg,
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+            result = run_ffmpeg_command(command, timeout=600)
+            if result.returncode != 0:
+                logger.warning("Subscribe outro skipped: ffmpeg concat failed")
+                return 0.0
+            shutil.move(str(output_path), str(clip_path))
+            logger.info(
+                f"Appended {duration:.1f}s subscribe outro to {clip_path.name}"
+            )
+            return duration
+    except Exception as e:
+        logger.warning(f"Subscribe outro skipped for {clip_path.name}: {e}")
+        return 0.0
+
+
+def create_clips_from_segments(    video_path: Path,
     segments: List[Dict[str, Any]],
     output_dir: Path,
     font_family: Optional[str] = None,
@@ -417,10 +582,14 @@ def create_clips_from_segments(
                 )
                 continue
 
-            clip_filename = (
-                f"clip_{i + 1}_{segment['start_time'].replace(':', '')}-"
-                f"{segment['end_time'].replace(':', '')}_{uuid.uuid4().hex[:12]}.mp4"
-            )
+            clip_filename = build_clip_filename_block(
+                segment.get("seo_title"),
+                segment.get("seo_description"),
+                segment.get("seo_tags"),
+                clip_index=i,
+                start_time=segment["start_time"],
+                fallback_title=segment.get("hook_title") or segment.get("text"),
+            ) + ".mp4"
             clip_path = output_dir / clip_filename
 
             if provided_keep_ranges:
@@ -455,6 +624,8 @@ def create_clips_from_segments(
             if success:
                 save_clip_source_ranges(clip_path, keep_ranges)
                 cleaned_duration = sum(end - start for start, end in keep_ranges)
+                outro_seconds = append_subscribe_outro(clip_path)
+                cleaned_duration += outro_seconds
                 clip_info = {
                     "clip_id": i + 1,
                     "filename": clip_filename,
@@ -473,6 +644,9 @@ def create_clips_from_segments(
                     "shareability_score": segment.get("shareability_score", 0),
                     "hook_type": segment.get("hook_type"),
                     "hook_title": segment.get("hook_title"),
+                    "seo_title": segment.get("seo_title"),
+                    "seo_description": segment.get("seo_description"),
+                    "seo_tags": segment.get("seo_tags"),
                     "keep_ranges": keep_ranges,
                 }
                 clips_info.append(clip_info)

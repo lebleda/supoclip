@@ -23,6 +23,7 @@ from ..video_utils import (
     get_video_transcript,
     create_clips_with_transitions,
     create_optimized_clip,
+    append_subscribe_outro,
     load_cached_transcript_data,
     parse_timestamp_to_seconds,
     build_clip_keep_ranges,
@@ -36,7 +37,7 @@ from ..clip_source_map import (
     normalize_source_ranges,
     save_clip_source_ranges,
 )
-from ..ai import get_most_relevant_parts_by_transcript
+from ..ai import get_most_relevant_parts_by_transcript, build_clip_filename_block
 from ..config import get_config
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,9 @@ class VideoService:
             "shareability_score": 0,
             "hook_type": "fallback",
             "hook_title": None,
+            "seo_title": None,
+            "seo_description": None,
+            "seo_tags": None,
         }
 
     @staticmethod
@@ -272,12 +276,16 @@ class VideoService:
                 )
                 return None
 
-            unique_suffix = uuid.uuid4().hex[:12]
             clip_filename = (
-                f"clip_{clip_index + 1}_"
-                f"{segment['start_time'].replace(':', '')}-"
-                f"{segment['end_time'].replace(':', '')}_"
-                f"{unique_suffix}.mp4"
+                build_clip_filename_block(
+                    segment.get("seo_title"),
+                    segment.get("seo_description"),
+                    segment.get("seo_tags"),
+                    clip_index=clip_index,
+                    start_time=segment["start_time"],
+                    fallback_title=segment.get("hook_title") or segment.get("text"),
+                )
+                + ".mp4"
             )
             clip_path = output_dir / clip_filename
             if provided_keep_ranges:
@@ -317,8 +325,13 @@ class VideoService:
                 logger.error(f"Failed to create clip {clip_index + 1}")
                 return None
 
+            try:
+                outro_seconds = await run_in_thread(append_subscribe_outro, clip_path)
+            except Exception as e:
+                logger.warning(f"Subscribe outro skipped for clip {clip_index + 1}: {e}")
+                outro_seconds = 0.0
             save_clip_source_ranges(clip_path, keep_ranges)
-            cleaned_duration = sum(end - start for start, end in keep_ranges)
+            cleaned_duration = sum(end - start for start, end in keep_ranges) + outro_seconds
             logger.info(
                 f"Created clip {clip_index + 1}: {cleaned_duration:.1f}s"
             )
@@ -339,6 +352,9 @@ class VideoService:
                 "shareability_score": segment.get("shareability_score", 0),
                 "hook_type": segment.get("hook_type"),
                 "hook_title": segment.get("hook_title"),
+                "seo_title": segment.get("seo_title"),
+                "seo_description": segment.get("seo_description"),
+                "seo_tags": segment.get("seo_tags"),
                 "keep_ranges": keep_ranges,
             }
         except Exception as e:
@@ -559,6 +575,9 @@ class VideoService:
                         "shareability_score": virality.get("shareability_score", 0),
                         "hook_type": virality.get("hook_type"),
                         "hook_title": segment.get("hook_title"),
+                        "seo_title": segment.get("seo_title"),
+                        "seo_description": segment.get("seo_description"),
+                        "seo_tags": segment.get("seo_tags"),
                     }
                 else:
                     virality = segment.virality.model_dump() if segment.virality else {}
@@ -575,6 +594,9 @@ class VideoService:
                         "shareability_score": virality.get("shareability_score", 0),
                         "hook_type": virality.get("hook_type"),
                         "hook_title": getattr(segment, "hook_title", None),
+                        "seo_title": getattr(segment, "seo_title", None),
+                        "seo_description": getattr(segment, "seo_description", None),
+                        "seo_tags": getattr(segment, "seo_tags", None),
                     }
 
                 segment_payload["text"] = VideoService._ground_segment_text(

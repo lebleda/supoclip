@@ -9,7 +9,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; editor_lock falls back to msvcrt.
+    fcntl = None
 import hashlib
 import json
 import os
@@ -120,12 +123,32 @@ def atomic_json(path: Path, value: dict):
 @contextmanager
 def editor_lock(directory: Path):
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / ".lock").open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with (directory / ".lock").open("a+b") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+        else:
+            # Windows fallback: msvcrt byte-range lock (best effort, single user).
+            import msvcrt
+
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                locked = True
+            except OSError:
+                locked = False
+            try:
+                yield
+            finally:
+                if locked:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
 
 
 class RevisionConflict(ValueError):
